@@ -38,7 +38,7 @@ jobs:
         run: |
           npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6 --legacy-peer-deps
           rm -rf android capacitor.config.json capacitor.config.ts
-          npx cap init "MiaApp" "com.miaapp.clienti" --web-dir dist
+          npx cap init "GKAnalyst Premium" "com.gkanalyst.premium" --web-dir dist
           npx cap add android
           npx cap sync android
 
