@@ -34,12 +34,19 @@ jobs:
           npm install --legacy-peer-deps
           npx vite build --base=./
 
-      - name: 5. Trasforma in App Android con Capacitor
+     - name: 5. Trasforma in App Android con Capacitor e applica Icona
         run: |
-          npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6 --legacy-peer-deps
+          npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6 @capacitor/assets --legacy-peer-deps
           rm -rf android capacitor.config.json capacitor.config.ts
           npx cap init "GKAnalyst Premium" "com.gkanalyst.premium" --web-dir dist
           npx cap add android
+          # Se è presente icon.png, genera automaticamente tutte le icone Android
+          if [ -f "icon.png" ]; then
+            mkdir -p assets
+            cp icon.png assets/icon.png
+            cp icon.png assets/splash.png
+            npx capacitor-assets generate --android
+          fi
           npx cap sync android
 
       - name: 6. Genera il file APK
