@@ -28,24 +28,32 @@ jobs:
           node -e '
             const fs = require("fs");
             const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
-            pkg.name = "mia-app-clienti";
+            pkg.name = "gkanalyst-premium";
             fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2));
           '
           npm install --legacy-peer-deps
           npx vite build --base=./
 
-     - name: 5. Trasforma in App Android con Capacitor e applica Icona
+      - name: 5. Trasforma in App Android e applica Icona
         run: |
-          npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6 @capacitor/assets --legacy-peer-deps
+          npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6 --legacy-peer-deps
           rm -rf android capacitor.config.json capacitor.config.ts
           npx cap init "GKAnalyst Premium" "com.gkanalyst.premium" --web-dir dist
           npx cap add android
-          # Se è presente icon.png, genera automaticamente tutte le icone Android
+          # Applica icon.png (di qualsiasi dimensione) a tutte le cartelle Android
           if [ -f "icon.png" ]; then
-            mkdir -p assets
-            cp icon.png assets/icon.png
-            cp icon.png assets/splash.png
-            npx capacitor-assets generate --android
+            echo "Icona trovata! Ridimensionamento e applicazione in corso..."
+            rm -rf android/app/src/main/res/mipmap-anydpi-v26
+            convert icon.png -resize 48x48\! android/app/src/main/res/mipmap-mdpi/ic_launcher.png
+            convert icon.png -resize 48x48\! android/app/src/main/res/mipmap-mdpi/ic_launcher_round.png
+            convert icon.png -resize 72x72\! android/app/src/main/res/mipmap-hdpi/ic_launcher.png
+            convert icon.png -resize 72x72\! android/app/src/main/res/mipmap-hdpi/ic_launcher_round.png
+            convert icon.png -resize 96x96\! android/app/src/main/res/mipmap-xhdpi/ic_launcher.png
+            convert icon.png -resize 96x96\! android/app/src/main/res/mipmap-xhdpi/ic_launcher_round.png
+            convert icon.png -resize 144x144\! android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
+            convert icon.png -resize 144x144\! android/app/src/main/res/mipmap-xxhdpi/ic_launcher_round.png
+            convert icon.png -resize 192x192\! android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+            convert icon.png -resize 192x192\! android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.png
           fi
           npx cap sync android
 
@@ -58,5 +66,5 @@ jobs:
       - name: 7. Carica APK pronto per il download
         uses: actions/upload-artifact@v4
         with:
-          name: App-Pronta-APK
+          name: GKAnalyst-Premium-APK
           path: android/app/build/outputs/apk/debug/app-debug.apk
