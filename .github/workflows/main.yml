@@ -1,0 +1,48 @@
+name: Crea APK Android
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Scarica il codice
+        uses: actions/checkout@v4
+
+      - name: Configura Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Configura Java 21 per Android
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Installa dipendenze e compila Web App
+        run: |
+          npm install
+          npm run build
+
+      - name: Trasforma in progetto Android con Capacitor
+        run: |
+          npm install @capacitor/core @capacitor/cli @capacitor/android
+          npx cap init "MiaApp" "com.miaapp.clienti" --web-dir dist
+          npx cap add android
+          npx cap copy android
+
+      - name: Genera il file APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Salva APK pronto per il download
+        uses: actions/upload-artifact@v4
+        with:
+          name: App-Pronta-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk
