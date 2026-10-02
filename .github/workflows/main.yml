@@ -23,24 +23,18 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
-      - name: 4. Configura Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: 5. Installa dipendenze e compila Web App (Modalità sicura AI Studio)
+      - name: 4. Installa dipendenze e compila Web App
         run: |
-          # Corregge eventuali spazi o maiuscole nel nome dentro package.json
           node -e '
             const fs = require("fs");
             const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
             pkg.name = "mia-app-clienti";
             fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2));
           '
-          # Installa ignorando eventuali conflitti di versione di AI Studio
           npm install --legacy-peer-deps
-          # Compila direttamente con Vite con percorsi relativi (ignora blocchi TypeScript)
           npx vite build --base=./
 
-      - name: 6. Trasforma in App Android con Capacitor
+      - name: 5. Trasforma in App Android con Capacitor
         run: |
           npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6 --legacy-peer-deps
           rm -rf android capacitor.config.json capacitor.config.ts
@@ -48,13 +42,13 @@ jobs:
           npx cap add android
           npx cap sync android
 
-      - name: 7. Genera il file APK
+      - name: 6. Genera il file APK
         run: |
           cd android
           chmod +x gradlew
           ./gradlew assembleDebug
 
-      - name: 8. Carica APK pronto per il download
+      - name: 7. Carica APK pronto per il download
         uses: actions/upload-artifact@v4
         with:
           name: App-Pronta-APK
