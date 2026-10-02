@@ -1,0 +1,8 @@
+{
+  "name": "GKAnalytics Premium",
+  "description": "An advanced tool for coaches and goalkeepers to track and analyze performance. Log shots, crosses, and other events on an interactive goal, view statistics, and generate heatmaps to identify patterns and improve skills.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
