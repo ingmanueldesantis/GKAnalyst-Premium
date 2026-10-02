@@ -49,23 +49,12 @@ import {
 import { exportToCsv, exportStatsToXlsx } from './utils/export';
 import { translations } from './utils/translations';
 import {
-  googleSignIn,
-  getAccessToken,
-  logoutGoogle,
-  initAuth,
-  getCurrentUser,
-  clearCachedAccessToken,
-} from './services/googleAuth';
-import {
   extractFolderId,
-  scanDriveFolder,
-  createGoalkeeperSheetInDrive,
-  parsePlayerFromFileName,
-} from './services/googleDriveService';
-import {
-  readGoalkeeperSheet,
-  appendMatchToSheet,
-} from './services/googleSheetsService';
+  saveDatabaseToDrive,
+  loadDatabaseFromDrive,
+  checkDriveFolder,
+} from './services/driveSyncService';
+import { parsePlayerFromFileName } from './services/googleDriveService';
 
 const STORAGE_KEY_DRIVE = 'gkanaytics_drive_config';
 const STORAGE_KEY_PLAYERS = 'gkanaytics_players';
@@ -226,8 +215,26 @@ const App: React.FC = () => {
     }
   });
 
-  const [userEmail, setUserEmail] = useState<string | null>(null);
-  const [isConnectedGoogle, setIsConnectedGoogle] = useState<boolean>(false);
+  const [userEmail, setUserEmail] = useState<string | null>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY_DRIVE);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        return parsed.email || null;
+      }
+    } catch {}
+    return null;
+  });
+  const [isConnectedGoogle, setIsConnectedGoogle] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY_DRIVE);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        return Boolean(parsed.connected && parsed.folderId);
+      }
+    } catch {}
+    return false;
+  });
   const [isScanningDrive, setIsScanningDrive] = useState<boolean>(false);
   const [isSavingSettings, setIsSavingSettings] = useState<boolean>(false);
   const [isCreatingSheet, setIsCreatingSheet] = useState<boolean>(false);
@@ -264,20 +271,6 @@ const App: React.FC = () => {
     }
   }, [matchDetails]);
 
-  // Firebase auth state initialization
-  useEffect(() => {
-    const unsubscribe = initAuth(
-      (user) => {
-        setUserEmail(user.email || null);
-        setIsConnectedGoogle(true);
-      },
-      () => {
-        setIsConnectedGoogle(false);
-      }
-    );
-    return () => unsubscribe();
-  }, []);
-
   // Update selected player if list changes
   useEffect(() => {
     if (players.length > 0 && !selectedPlayerId) {
@@ -297,85 +290,90 @@ const App: React.FC = () => {
     document.documentElement.lang = language;
   }, [language, t.appSubtitle]);
 
-  // Scan Google Drive folder
+  // Scan Google Drive folder via Google Apps Script (NO POPUP!)
   const performDriveScan = useCallback(
-    async (folderId: string, token: string) => {
+    async (folderId: string, email?: string) => {
       setIsScanningDrive(true);
       setDriveScanError(null);
       setDriveScanMessage(null);
 
       try {
-        const sheetFiles = await scanDriveFolder(folderId, token);
+        const loadResult = await loadDatabaseFromDrive(folderId, email);
 
-        if (sheetFiles.length === 0) {
+        if (!loadResult.success) {
+          throw new Error(loadResult.message || 'Errore durante la connessione alla cartella Google Drive.');
+        }
+
+        if (!loadResult.data) {
           setDriveScanMessage(
             isItalian
-              ? 'Scansione completata: nessun foglio Google Sheets trovato nella cartella. Puoi aggiungerne uno nuovo dalla sezione Portieri.'
-              : 'Scan complete: No Google Sheets found in folder. You can add one from Goalkeepers.'
+              ? `Cartella Google Drive accessibile (${loadResult.folderName || folderId}). Nessun database precedente trovato: verrà creato al primo salvataggio.`
+              : `Google Drive folder verified (${loadResult.folderName || folderId}). Database will be created on first save.`
           );
           return;
         }
 
-        // Build or merge players from discovered spreadsheets
-        setPlayers((prevPlayers) => {
-          const merged: Player[] = [...prevPlayers];
+        const driveData = loadResult.data;
 
-          for (const file of sheetFiles) {
-            const parsed = parsePlayerFromFileName(file.name);
-            const existingIdx = merged.findIndex(
-              (p) =>
-                p.spreadsheetId === file.id ||
-                p.fileId === file.id ||
-                p.name.toLowerCase() === parsed.name.toLowerCase()
-            );
-
-            if (existingIdx >= 0) {
-              merged[existingIdx] = {
-                ...merged[existingIdx],
-                spreadsheetId: file.id,
-                fileId: file.id,
-                webViewLink: file.webViewLink,
-                lastModified: file.modifiedTime,
-                name: merged[existingIdx].name || parsed.name,
-                team: merged[existingIdx].team || parsed.team,
-              };
-            } else {
-              merged.push({
-                id: `sheet_${file.id}`,
-                name: parsed.name,
-                team: parsed.team || '',
-                spreadsheetId: file.id,
-                fileId: file.id,
-                webViewLink: file.webViewLink,
-                lastModified: file.modifiedTime,
-              });
+        // Restore or merge players
+        if (driveData.players && Array.isArray(driveData.players) && driveData.players.length > 0) {
+          setPlayers((prevPlayers) => {
+            const merged = [...prevPlayers];
+            for (const dp of driveData.players) {
+              const existingIdx = merged.findIndex(
+                (p) => p.id === dp.id || p.name.toLowerCase() === dp.name.toLowerCase()
+              );
+              if (existingIdx >= 0) {
+                merged[existingIdx] = { ...merged[existingIdx], ...dp };
+              } else {
+                merged.push(dp);
+              }
             }
-          }
-          return merged;
-        });
+            return merged;
+          });
 
-        // Set active player to first discovered if none selected
-        if (sheetFiles.length > 0) {
-          const firstSheet = sheetFiles[0];
-          setSelectedPlayerId((prev) => prev || `sheet_${firstSheet.id}`);
+          if (!selectedPlayerId && driveData.players.length > 0) {
+            setSelectedPlayerId(driveData.players[0].id);
+          }
         }
+
+        // Restore or merge events
+        if (driveData.events && Array.isArray(driveData.events) && driveData.events.length > 0) {
+          setEvents((prevEvents) => {
+            const map = new Map<string, SoccerEvent>();
+            prevEvents.forEach((e) => map.set(e.id, e));
+            driveData.events.forEach((e) => map.set(e.id, e));
+            return Array.from(map.values());
+          });
+        }
+
+        // Restore matchDetails if available
+        if (driveData.matchDetails && driveData.matchDetails.date) {
+          setMatchDetails((prev) => ({
+            ...prev,
+            ...driveData.matchDetails,
+          }));
+        }
+
+        const countPlayers = driveData.players ? driveData.players.length : 0;
+        const countEvents = driveData.events ? driveData.events.length : 0;
 
         setDriveScanMessage(
           isItalian
-            ? `Scansione completata con successo: trovati ${sheetFiles.length} file Google Sheets nella cartella.`
-            : `Scan completed successfully: Found ${sheetFiles.length} Google Sheets in folder.`
+            ? `Sincronizzazione completata: caricati ${countPlayers} portieri e ${countEvents} eventi dalla cartella Google Drive!`
+            : `Sync completed: loaded ${countPlayers} goalkeepers and ${countEvents} events from Google Drive!`
         );
       } catch (err: any) {
-        console.error('Scan error:', err);
+        console.error('Drive scan error:', err);
         setDriveScanError(err.message || 'Errore durante la scansione della cartella Google Drive.');
       } finally {
         setIsScanningDrive(false);
       }
     },
-    [isItalian]
+    [isItalian, selectedPlayerId]
   );
 
-  // Save Settings & Authenticate
+  // Save Settings & Connect Drive via Google Apps Script (NO POPUP!)
   const handleSaveDriveConfig = async (folderInput: string, email: string) => {
     setIsSavingSettings(true);
     setDriveScanError(null);
@@ -392,109 +390,81 @@ const App: React.FC = () => {
       return;
     }
 
-    const updatedConfig: GoogleDriveConfig = {
-      folderInput,
-      folderId,
-      email,
-      connected: false,
-    };
-
     try {
-      // 1. Clear previous cached token so Google consent screen presents Drive & Sheets scopes
-      clearCachedAccessToken();
-      const authResult = await googleSignIn(email, true);
-      if (!authResult?.accessToken) {
-        throw new Error(
-          isItalian
-            ? 'Token di accesso Google non ricevuto.'
-            : 'Access token not received from Google authentication.'
-        );
+      // 1. Verify folder accessibility via Apps Script (NO POPUP!)
+      const checkResult = await checkDriveFolder(folderId, email);
+      if (!checkResult.success) {
+        throw new Error(checkResult.message || 'Impossibile accedere alla cartella Google Drive.');
       }
 
-      updatedConfig.connected = true;
+      const updatedConfig: GoogleDriveConfig = {
+        folderInput,
+        folderId,
+        email,
+        connected: true,
+      };
+
       setDriveConfig(updatedConfig);
       localStorage.setItem(STORAGE_KEY_DRIVE, JSON.stringify(updatedConfig));
       setIsConnectedGoogle(true);
-      setUserEmail(authResult.user.email || email);
+      setUserEmail(email);
 
-      // 2. Immediately scan Google Drive folder
-      await performDriveScan(folderId, authResult.accessToken);
+      // 2. Scan and load any existing data from the Drive folder
+      await performDriveScan(folderId, email);
     } catch (err: any) {
       console.error('Config save error:', err);
-      clearCachedAccessToken();
-      setDriveScanError(err.message || (isItalian ? 'Autenticazione o salvataggio fallito.' : 'Authentication or save failed.'));
+      setDriveScanError(err.message || (isItalian ? 'Salvataggio o verifica cartella fallita.' : 'Save or folder verification failed.'));
     } finally {
       setIsSavingSettings(false);
     }
   };
 
-  // Manual folder rescan
+  // Manual folder rescan via Google Apps Script
   const handleScanDriveFolder = async () => {
     if (!driveConfig.folderId) {
       setDriveScanError(isItalian ? 'Cartella Google Drive non configurata.' : 'Google Drive folder not configured.');
       return;
     }
-    const token = await getAccessToken(true, driveConfig.email);
-    if (!token) {
-      setDriveScanError(isItalian ? 'Riconnessione a Google richiesta.' : 'Google re-authentication required.');
-      return;
-    }
-    await performDriveScan(driveConfig.folderId, token);
+    await performDriveScan(driveConfig.folderId, driveConfig.email);
   };
 
-  // Load historical match data from goalkeeper's Google Sheet
+  // Load historical match data from goalkeeper's Google Drive database
   const handleLoadPlayerHistory = useCallback(
     async (playerId: string) => {
       const player = players.find((p) => p.id === playerId);
       if (!player) return;
 
-      const spreadsheetId = player.spreadsheetId || player.fileId;
-      if (!spreadsheetId) {
-        return;
-      }
+      if (!driveConfig.folderId) return;
 
       setIsLoadingHistory(true);
       setDriveScanError(null);
 
       try {
-        const token = await getAccessToken(true, driveConfig.email);
-        if (!token) {
-          throw new Error('Google token expired. Please reconnect in Settings.');
+        const loadResult = await loadDatabaseFromDrive(driveConfig.folderId, driveConfig.email);
+        if (loadResult.success && loadResult.data) {
+          const driveData = loadResult.data;
+          if (driveData.events && Array.isArray(driveData.events)) {
+            const playerEvts = driveData.events.filter((e) => e.playerId === playerId);
+            setEvents((prev) => {
+              const others = prev.filter((e) => e.playerId !== playerId);
+              return [...others, ...playerEvts];
+            });
+
+            setSaveSuccessBanner({
+              message: isItalian
+                ? `Dati storici per ${player.name} caricati (${playerEvts.length} eventi da Google Drive).`
+                : `Historical data for ${player.name} loaded (${playerEvts.length} events from Google Drive).`,
+            });
+          }
         }
-
-        const parseResult = await readGoalkeeperSheet(spreadsheetId, token, player.id);
-
-        if (parseResult.events.length > 0) {
-          // Replace or merge events for this player
-          setEvents((prev) => {
-            const others = prev.filter((e) => e.playerId !== player.id);
-            return [...others, ...parseResult.events];
-          });
-        }
-
-        if (parseResult.lastMatchDetails && parseResult.lastMatchDetails.date) {
-          setMatchDetails((prev) => ({
-            ...prev,
-            date: parseResult.lastMatchDetails!.date || prev.date,
-            matchName: parseResult.lastMatchDetails!.matchName || prev.matchName,
-            competition: parseResult.lastMatchDetails!.competition || prev.competition,
-          }));
-        }
-
-        setSaveSuccessBanner({
-          message: isItalian
-            ? `Dati storici per ${player.name} caricati (${parseResult.events.length} eventi).`
-            : `Historical data for ${player.name} loaded (${parseResult.events.length} events).`,
-          sheetUrl: player.webViewLink,
-        });
       } catch (err: any) {
-        console.error('Error loading historical sheet data:', err);
-        setDriveScanError(err.message || 'Errore nel caricamento dei dati dal foglio Google Sheet.');
+        console.error('Error loading historical data from Drive:', err);
+        setDriveScanError(err.message || 'Errore nel caricamento dei dati da Google Drive.');
       } finally {
         setIsLoadingHistory(false);
       }
     },
-    [players, driveConfig.email, isItalian]
+    [players, driveConfig.folderId, driveConfig.email, isItalian]
   );
 
   // Select a goalkeeper: updates selection and loads their historical Google Sheet data
@@ -503,68 +473,53 @@ const App: React.FC = () => {
     handleLoadPlayerHistory(id);
   };
 
-  // Disconnect Google Account
+  // Disconnect Google Drive
   const handleDisconnectGoogle = async () => {
-    await logoutGoogle();
     setIsConnectedGoogle(false);
     setUserEmail(null);
-    setDriveConfig((prev) => ({ ...prev, connected: false }));
-    localStorage.setItem(STORAGE_KEY_DRIVE, JSON.stringify({ ...driveConfig, connected: false }));
+    const updated = { ...driveConfig, connected: false };
+    setDriveConfig(updated);
+    localStorage.setItem(STORAGE_KEY_DRIVE, JSON.stringify(updated));
+    setDriveScanMessage(isItalian ? 'Google Drive disconnesso.' : 'Google Drive disconnected.');
   };
 
-  // Add a new goalkeeper: creates a new Google Sheet inside the Drive folder if configured!
+  // Add a new goalkeeper: saves locally and syncs to Drive folder if configured
   const handleAddPlayer = async (name: string, team: string) => {
     const trimmedName = name.trim();
     const trimmedTeam = team.trim();
     if (!trimmedName) return;
 
+    const newPlayer: Player = {
+      id: `p_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      name: trimmedName,
+      team: trimmedTeam,
+    };
+
+    const updatedPlayers = [...players, newPlayer];
+    setPlayers(updatedPlayers);
+    setSelectedPlayerId(newPlayer.id);
+
     if (driveConfig.folderId && isConnectedGoogle) {
       setIsCreatingSheet(true);
       setDriveScanError(null);
       try {
-        const token = await getAccessToken(true, driveConfig.email);
-        if (!token) throw new Error('Google token required to create Sheet in Drive.');
-
-        const newSheet = await createGoalkeeperSheetInDrive(
-          driveConfig.folderId,
-          trimmedName,
-          trimmedTeam,
-          token
-        );
-
-        const newPlayer: Player = {
-          id: `sheet_${newSheet.id}`,
-          name: trimmedName,
-          team: trimmedTeam,
-          spreadsheetId: newSheet.id,
-          fileId: newSheet.id,
-          webViewLink: newSheet.webViewLink,
-        };
-
-        setPlayers((prev) => [...prev, newPlayer]);
-        setSelectedPlayerId(newPlayer.id);
+        await saveDatabaseToDrive(driveConfig.folderId, {
+          players: updatedPlayers,
+          events,
+          matchDetails,
+          email: driveConfig.email,
+        });
 
         setSaveSuccessBanner({
           message: isItalian
-            ? `Creato con successo il foglio Google Sheet per "${trimmedName}" nella cartella Drive!`
-            : `Successfully created Google Sheet for "${trimmedName}" in Drive folder!`,
-          sheetUrl: newSheet.webViewLink,
+            ? `Portiere "${trimmedName}" aggiunto e sincronizzato nella cartella Google Drive!`
+            : `Goalkeeper "${trimmedName}" added and synced to Google Drive folder!`,
         });
       } catch (err: any) {
-        console.error('Error creating sheet in Drive:', err);
-        setDriveScanError(err.message || 'Impossibile creare il Google Sheet nella cartella Drive.');
-        // Fallback: add player locally
-        const newPlayer: Player = { id: `p_${Date.now()}`, name: trimmedName, team: trimmedTeam };
-        setPlayers((prev) => [...prev, newPlayer]);
-        setSelectedPlayerId(newPlayer.id);
+        console.error('Error syncing new player to Drive:', err);
       } finally {
         setIsCreatingSheet(false);
       }
-    } else {
-      // Local addition
-      const newPlayer: Player = { id: `p_${Date.now()}`, name: trimmedName, team: trimmedTeam };
-      setPlayers((prev) => [...prev, newPlayer]);
-      setSelectedPlayerId(newPlayer.id);
     }
   };
 
@@ -751,7 +706,7 @@ const App: React.FC = () => {
     setIsSyncModalOpen(true);
   };
 
-  // Confirm Save & Append Rows to Goalkeeper's Google Sheet
+  // Confirm Save & Sync to Goalkeeper's Google Drive database (NO POPUP!)
   const handleConfirmSaveToSheets = async () => {
     if (!selectedPlayer) return;
 
@@ -759,44 +714,24 @@ const App: React.FC = () => {
     setDriveScanError(null);
 
     try {
-      const token = await getAccessToken(true, driveConfig.email);
-      if (!token) {
-        throw new Error('Google authentication required. Please connect in Settings.');
-      }
-
-      let spreadsheetId = selectedPlayer.spreadsheetId || selectedPlayer.fileId;
-
-      // If the player doesn't have a spreadsheet yet, create one in the Drive folder!
-      if (!spreadsheetId) {
-        if (!driveConfig.folderId) {
-          throw new Error('Google Drive folder is not configured. Please set it in Settings.');
-        }
-        const created = await createGoalkeeperSheetInDrive(
-          driveConfig.folderId,
-          selectedPlayer.name,
-          selectedPlayer.team,
-          token
-        );
-        spreadsheetId = created.id;
-
-        // Update player with spreadsheetId
-        setPlayers((prev) =>
-          prev.map((p) =>
-            p.id === selectedPlayer.id
-              ? { ...p, spreadsheetId: created.id, fileId: created.id, webViewLink: created.webViewLink }
-              : p
-          )
+      if (!driveConfig.folderId) {
+        throw new Error(
+          isItalian
+            ? 'Cartella Google Drive non configurata. Impostala nelle Impostazioni.'
+            : 'Google Drive folder is not configured. Please set it in Settings.'
         );
       }
 
-      // Append match rows
-      const result = await appendMatchToSheet(
-        spreadsheetId,
-        selectedPlayer,
+      const result = await saveDatabaseToDrive(driveConfig.folderId, {
+        players,
+        events,
         matchDetails,
-        playerEvents,
-        token
-      );
+        email: driveConfig.email,
+      });
+
+      if (!result.success) {
+        throw new Error(result.message || 'Errore durante il salvataggio su Google Drive.');
+      }
 
       // Reset the graphic input in tracking for new recordings
       setEvents((prev) => prev.filter((e) => e.playerId !== selectedPlayer.id));
@@ -806,19 +741,18 @@ const App: React.FC = () => {
       setIsSyncModalOpen(false);
       setSaveSuccessBanner({
         message: isItalian
-          ? `Partita salvata con successo! Aggiunte ${result.appendedRows} righe al foglio di ${selectedPlayer.name}. L'inserimento grafico nel tracciamento è stato resettato per le nuove registrazioni.`
-          : `Match saved successfully! Appended ${result.appendedRows} rows to ${selectedPlayer.name}'s Google Sheet. Graphic tracking reset for new recordings.`,
-        sheetUrl: selectedPlayer.webViewLink,
+          ? `Partita salvata con successo nella cartella Google Drive (${result.folderName || 'Drive'})! L'inserimento grafico nel tracciamento è stato resettato per le nuove registrazioni.`
+          : `Match saved successfully to Google Drive folder! Graphic tracking reset for new recordings.`,
       });
     } catch (err: any) {
-      console.error('Error saving match to Google Sheets:', err);
-      setDriveScanError(err.message || 'Errore durante il salvataggio su Google Sheets.');
+      console.error('Error saving match to Google Drive:', err);
+      setDriveScanError(err.message || 'Errore durante il salvataggio su Google Drive.');
     } finally {
       setIsSavingMatchToSheets(false);
     }
   };
 
-  // Direct Save from Match section: saves match details & events to Google Sheets, then resets graphic tracking
+  // Direct Save from Match section: saves match details & events to Google Drive, then resets graphic tracking
   const handleSaveMatchFromMatchView = async () => {
     if (!selectedPlayer) {
       setDriveScanError(
@@ -843,9 +777,8 @@ const App: React.FC = () => {
 
     try {
       const currentEvents = events.filter((e) => e.playerId === selectedPlayer.id);
-      const hasDriveConfigured = !!driveConfig.folderId || !!selectedPlayer.spreadsheetId;
 
-      if (!hasDriveConfigured) {
+      if (!driveConfig.folderId) {
         // Local save fallback if Google Drive is not configured
         setEvents((prev) => prev.filter((e) => e.playerId !== selectedPlayer.id));
         setSelectedSide(null);
@@ -853,57 +786,23 @@ const App: React.FC = () => {
 
         setSaveSuccessBanner({
           message: isItalian
-            ? `Partita salvata in locale per ${selectedPlayer.name} (${currentEvents.length} eventi). L'inserimento grafico nel tracciamento è stato resettato per le nuove registrazioni. Per sincronizzare direttamente sul tuo Google Sheet, collega Google Drive nelle Impostazioni.`
-            : `Match saved locally for ${selectedPlayer.name} (${currentEvents.length} events). Graphic tracking has been reset for new recordings. Connect Google Drive in Settings to sync directly to Google Sheets.`,
+            ? `Partita salvata in locale per ${selectedPlayer.name} (${currentEvents.length} eventi). L'inserimento grafico nel tracciamento è stato resettato per le nuove registrazioni. Per sincronizzare su Google Drive, inserisci il link della cartella nelle Impostazioni.`
+            : `Match saved locally for ${selectedPlayer.name} (${currentEvents.length} events). Graphic tracking has been reset for new recordings. Connect Google Drive in Settings to sync directly to Google Drive.`,
         });
         return;
       }
 
-      const token = await getAccessToken(true, driveConfig.email);
-      if (!token) {
-        throw new Error(
-          isItalian
-            ? 'Autenticazione Google richiesta. Riconnetti il tuo account nelle Impostazioni.'
-            : 'Google authentication required. Please connect in Settings.'
-        );
-      }
-
-      let spreadsheetId = selectedPlayer.spreadsheetId || selectedPlayer.fileId;
-
-      if (!spreadsheetId) {
-        if (!driveConfig.folderId) {
-          throw new Error(
-            isItalian
-              ? 'Cartella Google Drive non configurata. Impostala nelle Impostazioni.'
-              : 'Google Drive folder is not configured. Please set it in Settings.'
-          );
-        }
-        const created = await createGoalkeeperSheetInDrive(
-          driveConfig.folderId,
-          selectedPlayer.name,
-          selectedPlayer.team,
-          token
-        );
-        spreadsheetId = created.id;
-
-        // Update player with spreadsheetId
-        setPlayers((prev) =>
-          prev.map((p) =>
-            p.id === selectedPlayer.id
-              ? { ...p, spreadsheetId: created.id, fileId: created.id, webViewLink: created.webViewLink }
-              : p
-          )
-        );
-      }
-
-      // Append match rows to the goalkeeper's Google Sheet
-      const result = await appendMatchToSheet(
-        spreadsheetId,
-        selectedPlayer,
+      // Save to Google Drive via Apps Script
+      const result = await saveDatabaseToDrive(driveConfig.folderId, {
+        players,
+        events,
         matchDetails,
-        currentEvents,
-        token
-      );
+        email: driveConfig.email,
+      });
+
+      if (!result.success) {
+        throw new Error(result.message || 'Errore durante il salvataggio su Google Drive.');
+      }
 
       // RESET THE GRAPHIC INPUT IN TRACKING FOR NEW ENTRIES
       setEvents((prev) => prev.filter((e) => e.playerId !== selectedPlayer.id));
@@ -912,15 +811,14 @@ const App: React.FC = () => {
 
       setSaveSuccessBanner({
         message: isItalian
-          ? `Partita salvata con successo sul foglio Google Sheet di ${selectedPlayer.name}! Aggiunte ${result.appendedRows} righe. L'inserimento grafico nel tracciamento è stato resettato per le nuove registrazioni.`
-          : `Match saved successfully to ${selectedPlayer.name}'s Google Sheet! Appended ${result.appendedRows} rows. Graphic tracking has been reset for new recordings.`,
-        sheetUrl: selectedPlayer.webViewLink,
+          ? `Partita salvata con successo nella cartella Google Drive (${result.folderName || 'Drive'})! L'inserimento grafico nel tracciamento è stato resettato per le nuove registrazioni.`
+          : `Match saved successfully to Google Drive folder! Graphic tracking has been reset for new recordings.`,
       });
     } catch (err: any) {
       console.error('Error saving match from MatchView:', err);
       setDriveScanError(
         err.message ||
-          (isItalian ? 'Errore durante il salvataggio su Google Sheets.' : 'Error saving to Google Sheets.')
+          (isItalian ? 'Errore durante il salvataggio su Google Drive.' : 'Error saving to Google Drive.')
       );
     } finally {
       setIsSavingMatchToSheets(false);
